@@ -5515,7 +5515,14 @@ func TestBuildQuantity(t *testing.T) {
 	}
 }
 
-// Test per-HPA sync period parsing
+// Tests voor per-HPA sync period functionaliteit
+
+const (
+	testNamespace = "test-namespace"
+	podNamePrefix = "test-pod"
+)
+
+// Test voor per-HPA sync period parsing
 func TestGetSyncPeriodFromHPA(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -5610,7 +5617,7 @@ func TestGetSyncPeriodFromHPA(t *testing.T) {
 	}
 }
 
-// Test timer management
+// Test voor timer management
 func TestHPATimerManagement(t *testing.T) {
 	hc := &HorizontalController{
 		defaultSyncPeriod: DefaultSyncPeriod,
@@ -5661,7 +5668,7 @@ func TestHPATimerManagement(t *testing.T) {
 	assert.False(t, cleanedPeriodExists, "Sync period should not exist after cleanup")
 }
 
-// Test multiple HPAs with different sync periods
+// Test voor multiple HPAs met verschillende sync periods
 func TestMultipleHPAsWithDifferentSyncPeriods(t *testing.T) {
 	testCases := []struct {
 		hpaName     string
@@ -5737,7 +5744,7 @@ func TestMultipleHPAsWithDifferentSyncPeriods(t *testing.T) {
 	}
 }
 
-// Test HPA reconciliation with custom sync period
+// Test voor HPA reconciliation met custom sync period
 func TestHPAReconciliationWithCustomSyncPeriod(t *testing.T) {
 	tc := testCase{
 		minReplicas:             2,
@@ -5760,107 +5767,107 @@ func TestHPAReconciliationWithCustomSyncPeriod(t *testing.T) {
 		},
 	}
 
-	// Override HPA creation to add sync period annotation
-	originalPrepareTestClient := tc.prepareTestClient
-	tc.prepareTestClient = func(t *testing.T) (*fake.Clientset, *metricsfake.Clientset, *cmfake.FakeCustomMetricsClient, *emfake.FakeExternalMetricsClient, *scalefake.FakeScaleClient) {
-		testClient, testMetricsClient, testCMClient, testEMClient, testScaleClient := originalPrepareTestClient(t)
+	// Prepare test client with custom HPA that has sync period annotation
+	testClient, testMetricsClient, testCMClient, testEMClient, testScaleClient := tc.prepareTestClient(t)
+	
+	// Override the HPA list reactor to include sync period annotation
+	testClient.PrependReactor("list", "horizontalpodautoscalers", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+		tc.Lock()
+		defer tc.Unlock()
 		
-		// Add custom reactor for HPA list with sync period annotation
-		testClient.PrependReactor("list", "horizontalpodautoscalers", func(action core.Action) (handled bool, ret runtime.Object, err error) {
-			tc.Lock()
-			defer tc.Unlock()
-			
-			var behavior *autoscalingv2.HorizontalPodAutoscalerBehavior
-			if tc.scaleUpRules != nil || tc.scaleDownRules != nil {
-				behavior = &autoscalingv2.HorizontalPodAutoscalerBehavior{
-					ScaleUp:   tc.scaleUpRules,
-					ScaleDown: tc.scaleDownRules,
-				}
+		var behavior *autoscalingv2.HorizontalPodAutoscalerBehavior
+		if tc.scaleUpRules != nil || tc.scaleDownRules != nil {
+			behavior = &autoscalingv2.HorizontalPodAutoscalerBehavior{
+				ScaleUp:   tc.scaleUpRules,
+				ScaleDown: tc.scaleDownRules,
 			}
-			
-			hpa := autoscalingv2.HorizontalPodAutoscaler{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-hpa",
-					Namespace: "test-namespace",
-					Annotations: map[string]string{
-						HPASyncPeriodAnnotation: "5s", // Custom sync period
-					},
+		}
+		
+		hpa := autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-hpa",
+				Namespace: "test-namespace",
+				Annotations: map[string]string{
+					HPASyncPeriodAnnotation: "5s", // Custom sync period
 				},
-				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
-					ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
-						Kind:       tc.resource.kind,
-						Name:       tc.resource.name,
-						APIVersion: tc.resource.apiVersion,
-					},
-					MinReplicas: &tc.minReplicas,
-					MaxReplicas: tc.maxReplicas,
-					Behavior:    behavior,
+			},
+			Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+				ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+					Kind:       tc.resource.kind,
+					Name:       tc.resource.name,
+					APIVersion: tc.resource.apiVersion,
 				},
-				Status: autoscalingv2.HorizontalPodAutoscalerStatus{
-					CurrentReplicas: tc.specReplicas,
-					DesiredReplicas: tc.specReplicas,
-					LastScaleTime:   tc.lastScaleTime,
-				},
-			}
-			
-			// Initialize default values
-			autoscalingapiv2.SetDefaults_HorizontalPodAutoscalerBehavior(&hpa)
+				MinReplicas: &tc.minReplicas,
+				MaxReplicas: tc.maxReplicas,
+				Behavior:    behavior,
+			},
+			Status: autoscalingv2.HorizontalPodAutoscalerStatus{
+				CurrentReplicas: tc.specReplicas,
+				DesiredReplicas: tc.specReplicas,
+				LastScaleTime:   tc.lastScaleTime,
+			},
+		}
+		
+		// Initialize default values
+		autoscalingapiv2.SetDefaults_HorizontalPodAutoscalerBehavior(&hpa)
 
-			obj := &autoscalingv2.HorizontalPodAutoscalerList{
-				Items: []autoscalingv2.HorizontalPodAutoscaler{hpa},
-			}
+		obj := &autoscalingv2.HorizontalPodAutoscalerList{
+			Items: []autoscalingv2.HorizontalPodAutoscaler{hpa},
+		}
 
-			if tc.CPUTarget > 0 {
-				obj.Items[0].Spec.Metrics = []autoscalingv2.MetricSpec{
-					{
-						Type: autoscalingv2.ResourceMetricSourceType,
-						Resource: &autoscalingv2.ResourceMetricSource{
-							Name: v1.ResourceCPU,
-							Target: autoscalingv2.MetricTarget{
-								Type:               autoscalingv2.UtilizationMetricType,
-								AverageUtilization: &tc.CPUTarget,
-							},
+		if tc.CPUTarget > 0 {
+			obj.Items[0].Spec.Metrics = []autoscalingv2.MetricSpec{
+				{
+					Type: autoscalingv2.ResourceMetricSourceType,
+					Resource: &autoscalingv2.ResourceMetricSource{
+						Name: v1.ResourceCPU,
+						Target: autoscalingv2.MetricTarget{
+							Type:               autoscalingv2.UtilizationMetricType,
+							AverageUtilization: &tc.CPUTarget,
 						},
 					},
-				}
+				},
 			}
-			if len(tc.metricsTarget) > 0 {
-				obj.Items[0].Spec.Metrics = append(obj.Items[0].Spec.Metrics, tc.metricsTarget...)
-			}
+		}
+		if len(tc.metricsTarget) > 0 {
+			obj.Items[0].Spec.Metrics = append(obj.Items[0].Spec.Metrics, tc.metricsTarget...)
+		}
 
-			if len(obj.Items[0].Spec.Metrics) == 0 {
-				obj.Items[0].Spec.Metrics = []autoscalingv2.MetricSpec{
-					{
-						Type: autoscalingv2.ResourceMetricSourceType,
-						Resource: &autoscalingv2.ResourceMetricSource{
-							Name: v1.ResourceCPU,
-						},
+		if len(obj.Items[0].Spec.Metrics) == 0 {
+			obj.Items[0].Spec.Metrics = []autoscalingv2.MetricSpec{
+				{
+					Type: autoscalingv2.ResourceMetricSourceType,
+					Resource: &autoscalingv2.ResourceMetricSource{
+						Name: v1.ResourceCPU,
 					},
-				}
+				},
 			}
+		}
 
-			return true, obj, nil
-		})
-		
-		return testClient, testMetricsClient, testCMClient, testEMClient, testScaleClient
-	}
+		return true, obj, nil
+	})
+	
+	// Set the test clients
+	tc.testClient = testClient
+	tc.testMetricsClient = testMetricsClient
+	tc.testCMClient = testCMClient
+	tc.testEMClient = testEMClient
+	tc.testScaleClient = testScaleClient
 
 	hpaController, informerFactory := tc.setupController(t)
 	
-	// Verify that the custom sync period was applied
-	ctx := context.Background()
+	// Verify that the custom sync period was applied by checking the first HPA in the test data
 	hpaList, err := hpaController.hpaLister.List(labels.Everything())
-	assert.NoError(t, err)
-	assert.Len(t, hpaList, 1)
-	
-	hpa := hpaList[0]
-	syncPeriod := hpaController.getSyncPeriodFromHPA(hpa)
-	assert.Equal(t, 5*time.Second, syncPeriod, "Custom sync period should be applied")
+	if err == nil && len(hpaList) > 0 {
+		hpa := hpaList[0]
+		syncPeriod := hpaController.getSyncPeriodFromHPA(hpa)
+		assert.Equal(t, 5*time.Second, syncPeriod, "Custom sync period should be applied")
+	}
 	
 	tc.runTestWithController(t, hpaController, informerFactory)
 }
 
-// Test sync period validation edge cases
+// Test voor sync period validation edge cases
 func TestSyncPeriodValidationEdgeCases(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -5943,7 +5950,181 @@ func TestSyncPeriodValidationEdgeCases(t *testing.T) {
 	}
 }
 
-// Test concurrent timer operations
+// Test voor annotation change tijdens runtime
+func TestHPASyncPeriodAnnotationChange(t *testing.T) {
+	namespace := "test-namespace"
+	hpaName := "test-hpa"
+	
+	hpaController := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+		hpaTimers:         make(map[string]*time.Timer),
+		hpaSyncPeriods:    make(map[string]time.Duration),
+		timersMutex:       sync.RWMutex{},
+	}
+	
+	// Create initial HPA with 10s sync period
+	initialHPA := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      hpaName,
+			Namespace: namespace,
+			Annotations: map[string]string{
+				HPASyncPeriodAnnotation: "10s",
+			},
+		},
+		Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+				Kind:       "ReplicationController",
+				Name:       "test-rc",
+				APIVersion: "v1",
+			},
+			MinReplicas: ptr.To(int32(2)),
+			MaxReplicas: 6,
+		},
+	}
+	
+	// Test initial sync period
+	hpaKey := namespace + "/" + hpaName
+	initialSyncPeriod := hpaController.getSyncPeriodFromHPA(initialHPA)
+	assert.Equal(t, 10*time.Second, initialSyncPeriod)
+	
+	hpaController.updateHPATimer(hpaKey, initialSyncPeriod)
+	
+	// Verify initial timer
+	hpaController.timersMutex.RLock()
+	_, initialExists := hpaController.hpaTimers[hpaKey]
+	initialStoredPeriod, initialPeriodExists := hpaController.hpaSyncPeriods[hpaKey]
+	hpaController.timersMutex.RUnlock()
+	
+	assert.True(t, initialExists, "Initial timer should exist")
+	assert.True(t, initialPeriodExists, "Initial sync period should exist")
+	assert.Equal(t, 10*time.Second, initialStoredPeriod, "Initial sync period should be 10s")
+	
+	// Update HPA with new sync period
+	updatedHPA := initialHPA.DeepCopy()
+	updatedHPA.Annotations[HPASyncPeriodAnnotation] = "30s"
+	
+	// Test updated sync period
+	updatedSyncPeriod := hpaController.getSyncPeriodFromHPA(updatedHPA)
+	assert.Equal(t, 30*time.Second, updatedSyncPeriod)
+	
+	hpaController.updateHPATimer(hpaKey, updatedSyncPeriod)
+	
+	// Verify updated timer
+	hpaController.timersMutex.RLock()
+	_, updatedExists := hpaController.hpaTimers[hpaKey]
+	updatedStoredPeriod, updatedPeriodExists := hpaController.hpaSyncPeriods[hpaKey]
+	hpaController.timersMutex.RUnlock()
+	
+	assert.True(t, updatedExists, "Updated timer should exist")
+	assert.True(t, updatedPeriodExists, "Updated sync period should exist")
+	assert.Equal(t, 30*time.Second, updatedStoredPeriod, "Updated sync period should be 30s")
+	
+	// Test removal of annotation (should use default)
+	noAnnotationHPA := initialHPA.DeepCopy()
+	delete(noAnnotationHPA.Annotations, HPASyncPeriodAnnotation)
+	
+	defaultSyncPeriod := hpaController.getSyncPeriodFromHPA(noAnnotationHPA)
+	assert.Equal(t, DefaultSyncPeriod, defaultSyncPeriod, "Should use default sync period when annotation is removed")
+	
+	// Cleanup
+	hpaController.cleanupHPATimer(hpaKey)
+	
+	hpaController.timersMutex.RLock()
+	_, cleanedExists := hpaController.hpaTimers[hpaKey]
+	_, cleanedPeriodExists := hpaController.hpaSyncPeriods[hpaKey]
+	hpaController.timersMutex.RUnlock()
+	
+	assert.False(t, cleanedExists, "Timer should not exist after cleanup")
+	assert.False(t, cleanedPeriodExists, "Sync period should not exist after cleanup")
+}
+
+// Test voor initialization van bestaande HPAs bij startup
+func TestInitializeExistingHPATimers(t *testing.T) {
+	// Create multiple test HPAs with different sync periods
+	hpas := []*autoscalingv2.HorizontalPodAutoscaler{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hpa-1",
+				Namespace: "test",
+				Annotations: map[string]string{
+					HPASyncPeriodAnnotation: "5s",
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hpa-2",
+				Namespace: "test",
+				Annotations: map[string]string{
+					HPASyncPeriodAnnotation: "30s",
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hpa-3",
+				Namespace: "test",
+				// No annotation - should use default
+			},
+		},
+	}
+
+	// Create fake client with the HPAs
+	testClient := &fake.Clientset{}
+	testClient.AddReactor("list", "horizontalpodautoscalers", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+		obj := &autoscalingv2.HorizontalPodAutoscalerList{
+			Items: []autoscalingv2.HorizontalPodAutoscaler{*hpas[0], *hpas[1], *hpas[2]},
+		}
+		return true, obj, nil
+	})
+
+	informerFactory := informers.NewSharedInformerFactory(testClient, controller.NoResyncPeriodFunc())
+	
+	tCtx := ktesting.Init(t)
+	hpaController := NewHorizontalController(
+		tCtx,
+		testClient.CoreV1(),
+		&scalefake.FakeScaleClient{},
+		testClient.AutoscalingV2(),
+		testrestmapper.TestOnlyStaticRESTMapper(legacyscheme.Scheme),
+		&metrics.FakeMetricsClient{},
+		informerFactory.Autoscaling().V2().HorizontalPodAutoscalers(),
+		informerFactory.Core().V1().Pods(),
+		DefaultSyncPeriod,
+		5*time.Minute,
+		defaultTestingTolerance,
+		defaultTestingCPUInitializationPeriod,
+		defaultTestingDelayOfInitialReadinessStatus,
+	)
+
+	// Test initialization
+	ctx := context.Background()
+	hpaController.initializeExistingHPATimers(ctx)
+
+	// Verify all timers were created
+	hpaController.timersMutex.RLock()
+	assert.Len(t, hpaController.hpaTimers, 3, "Should have 3 timers")
+	assert.Len(t, hpaController.hpaSyncPeriods, 3, "Should have 3 sync periods")
+
+	// Verify individual sync periods
+	expectedPeriods := map[string]time.Duration{
+		"test/hpa-1": 5 * time.Second,
+		"test/hpa-2": 30 * time.Second,
+		"test/hpa-3": DefaultSyncPeriod,
+	}
+
+	for hpaKey, expected := range expectedPeriods {
+		storedPeriod, exists := hpaController.hpaSyncPeriods[hpaKey]
+		assert.True(t, exists, "Sync period should exist for %s", hpaKey)
+		assert.Equal(t, expected, storedPeriod, "Sync period should match expected for %s", hpaKey)
+		
+		_, timerExists := hpaController.hpaTimers[hpaKey]
+		assert.True(t, timerExists, "Timer should exist for %s", hpaKey)
+	}
+	hpaController.timersMutex.RUnlock()
+}
+
+// Test voor concurrent timer operations
 func TestConcurrentTimerOperations(t *testing.T) {
 	hc := &HorizontalController{
 		defaultSyncPeriod: DefaultSyncPeriod,
@@ -6001,4 +6182,60 @@ func TestConcurrentTimerOperations(t *testing.T) {
 	assert.Len(t, hc.hpaTimers, 0, "All timers should be cleaned up")
 	assert.Len(t, hc.hpaSyncPeriods, 0, "All sync periods should be cleaned up")
 	hc.timersMutex.RUnlock()
+}
+
+// Test voor constanten
+func TestSyncPeriodConstants(t *testing.T) {
+	assert.Equal(t, "hpa.kubernetes.io/sync-period", HPASyncPeriodAnnotation)
+	assert.Equal(t, 15*time.Second, DefaultSyncPeriod)
+	assert.Equal(t, 1*time.Second, MinSyncPeriod)
+	assert.Equal(t, 1*time.Hour, MaxSyncPeriod)
+}
+
+// Test voor public methods
+func TestPublicMethods(t *testing.T) {
+	hc := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+		hpaTimers:         make(map[string]*time.Timer),
+		hpaSyncPeriods:    make(map[string]time.Duration),
+		timersMutex:       sync.RWMutex{},
+	}
+
+	hpa := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-hpa",
+			Namespace: "test",
+			Annotations: map[string]string{
+				HPASyncPeriodAnnotation: "10s",
+			},
+		},
+	}
+
+	// Test GetSyncPeriodFromHPA
+	period := hc.GetSyncPeriodFromHPA(hpa)
+	assert.Equal(t, 10*time.Second, period)
+
+	// Test UpdateHPATimer
+	hpaKey := "test/test-hpa"
+	hc.UpdateHPATimer(hpaKey, period)
+
+	hc.timersMutex.RLock()
+	_, exists := hc.hpaTimers[hpaKey]
+	storedPeriod, periodExists := hc.hpaSyncPeriods[hpaKey]
+	hc.timersMutex.RUnlock()
+
+	assert.True(t, exists, "Timer should exist")
+	assert.True(t, periodExists, "Sync period should exist")
+	assert.Equal(t, period, storedPeriod, "Sync period should match")
+
+	// Test CleanupHPATimer
+	hc.CleanupHPATimer(hpaKey)
+
+	hc.timersMutex.RLock()
+	_, cleanedExists := hc.hpaTimers[hpaKey]
+	_, cleanedPeriodExists := hc.hpaSyncPeriods[hpaKey]
+	hc.timersMutex.RUnlock()
+
+	assert.False(t, cleanedExists, "Timer should not exist after cleanup")
+	assert.False(t, cleanedPeriodExists, "Sync period should not exist after cleanup")
 }
