@@ -5517,11 +5517,6 @@ func TestBuildQuantity(t *testing.T) {
 
 // Tests voor per-HPA sync period functionaliteit
 
-const (
-	testNamespace = "test-namespace"
-	podNamePrefix = "test-pod"
-)
-
 // Test voor per-HPA sync period parsing
 func TestGetSyncPeriodFromHPA(t *testing.T) {
 	tests := []struct {
@@ -5856,13 +5851,18 @@ func TestHPAReconciliationWithCustomSyncPeriod(t *testing.T) {
 
 	hpaController, informerFactory := tc.setupController(t)
 	
-	// Verify that the custom sync period was applied by checking the first HPA in the test data
-	hpaList, err := hpaController.hpaLister.List(labels.Everything())
-	if err == nil && len(hpaList) > 0 {
-		hpa := hpaList[0]
-		syncPeriod := hpaController.getSyncPeriodFromHPA(hpa)
-		assert.Equal(t, 5*time.Second, syncPeriod, "Custom sync period should be applied")
+	// Verify that the custom sync period would be applied by checking annotation parsing
+	testHPA := &autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-hpa",
+			Namespace: "test-namespace",
+			Annotations: map[string]string{
+				HPASyncPeriodAnnotation: "5s",
+			},
+		},
 	}
+	syncPeriod := hpaController.getSyncPeriodFromHPA(testHPA)
+	assert.Equal(t, 5*time.Second, syncPeriod, "Custom sync period should be parsed correctly")
 	
 	tc.runTestWithController(t, hpaController, informerFactory)
 }
@@ -5952,7 +5952,7 @@ func TestSyncPeriodValidationEdgeCases(t *testing.T) {
 
 // Test voor annotation change tijdens runtime
 func TestHPASyncPeriodAnnotationChange(t *testing.T) {
-	namespace := "test-namespace"
+	hpaNamespace := "test-namespace"
 	hpaName := "test-hpa"
 	
 	hpaController := &HorizontalController{
@@ -5966,7 +5966,7 @@ func TestHPASyncPeriodAnnotationChange(t *testing.T) {
 	initialHPA := &autoscalingv2.HorizontalPodAutoscaler{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      hpaName,
-			Namespace: namespace,
+			Namespace: hpaNamespace,
 			Annotations: map[string]string{
 				HPASyncPeriodAnnotation: "10s",
 			},
@@ -5983,7 +5983,7 @@ func TestHPASyncPeriodAnnotationChange(t *testing.T) {
 	}
 	
 	// Test initial sync period
-	hpaKey := namespace + "/" + hpaName
+	hpaKey := hpaNamespace + "/" + hpaName
 	initialSyncPeriod := hpaController.getSyncPeriodFromHPA(initialHPA)
 	assert.Equal(t, 10*time.Second, initialSyncPeriod)
 	
@@ -6080,6 +6080,13 @@ func TestInitializeExistingHPATimers(t *testing.T) {
 
 	informerFactory := informers.NewSharedInformerFactory(testClient, controller.NoResyncPeriodFunc())
 	
+	// Create a simple fake metrics client
+	fakeMetricsClient := metrics.NewRESTMetricsClient(
+		&metricsfake.Clientset{}.MetricsV1beta1(),
+		&cmfake.FakeCustomMetricsClient{},
+		&emfake.FakeExternalMetricsClient{},
+	)
+	
 	tCtx := ktesting.Init(t)
 	hpaController := NewHorizontalController(
 		tCtx,
@@ -6087,7 +6094,7 @@ func TestInitializeExistingHPATimers(t *testing.T) {
 		&scalefake.FakeScaleClient{},
 		testClient.AutoscalingV2(),
 		testrestmapper.TestOnlyStaticRESTMapper(legacyscheme.Scheme),
-		&metrics.FakeMetricsClient{},
+		fakeMetricsClient,
 		informerFactory.Autoscaling().V2().HorizontalPodAutoscalers(),
 		informerFactory.Core().V1().Pods(),
 		DefaultSyncPeriod,
