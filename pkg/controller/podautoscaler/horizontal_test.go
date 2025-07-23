@@ -5514,3 +5514,491 @@ func TestBuildQuantity(t *testing.T) {
 		})
 	}
 }
+
+// Test per-HPA sync period parsing
+func TestGetSyncPeriodFromHPA(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expected    time.Duration
+	}{
+		{
+			name:        "no annotation",
+			annotations: nil,
+			expected:    DefaultSyncPeriod,
+		},
+		{
+			name:        "empty annotations",
+			annotations: map[string]string{},
+			expected:    DefaultSyncPeriod,
+		},
+		{
+			name: "valid sync period - 5 seconds",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "5s",
+			},
+			expected: 5 * time.Second,
+		},
+		{
+			name: "valid sync period - 2 minutes",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "2m",
+			},
+			expected: 2 * time.Minute,
+		},
+		{
+			name: "valid sync period - 30 seconds",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "30s",
+			},
+			expected: 30 * time.Second,
+		},
+		{
+			name: "invalid sync period format",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "invalid",
+			},
+			expected: DefaultSyncPeriod,
+		},
+		{
+			name: "sync period too small",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "500ms",
+			},
+			expected: MinSyncPeriod,
+		},
+		{
+			name: "sync period too large",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "2h",
+			},
+			expected: MaxSyncPeriod,
+		},
+		{
+			name: "minimum valid sync period",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "1s",
+			},
+			expected: 1 * time.Second,
+		},
+		{
+			name: "maximum valid sync period",
+			annotations: map[string]string{
+				HPASyncPeriodAnnotation: "1h",
+			},
+			expected: 1 * time.Hour,
+		},
+	}
+
+	hc := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-hpa",
+					Namespace:   "test",
+					Annotations: tt.annotations,
+				},
+			}
+
+			result := hc.getSyncPeriodFromHPA(hpa)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+// Test timer management
+func TestHPATimerManagement(t *testing.T) {
+	hc := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+		hpaTimers:         make(map[string]*time.Timer),
+		hpaSyncPeriods:    make(map[string]time.Duration),
+		timersMutex:       sync.RWMutex{},
+	}
+
+	hpaKey := "test-namespace/test-hpa"
+	syncPeriod := 10 * time.Second
+
+	// Test timer creation
+	hc.updateHPATimer(hpaKey, syncPeriod)
+
+	hc.timersMutex.RLock()
+	timer, exists := hc.hpaTimers[hpaKey]
+	period, periodExists := hc.hpaSyncPeriods[hpaKey]
+	hc.timersMutex.RUnlock()
+
+	assert.True(t, exists, "Timer should exist")
+	assert.True(t, periodExists, "Sync period should be stored")
+	assert.Equal(t, syncPeriod, period, "Stored sync period should match")
+	assert.NotNil(t, timer, "Timer should not be nil")
+
+	// Test timer update
+	newSyncPeriod := 20 * time.Second
+	hc.updateHPATimer(hpaKey, newSyncPeriod)
+
+	hc.timersMutex.RLock()
+	newTimer, newExists := hc.hpaTimers[hpaKey]
+	newPeriod, newPeriodExists := hc.hpaSyncPeriods[hpaKey]
+	hc.timersMutex.RUnlock()
+
+	assert.True(t, newExists, "New timer should exist")
+	assert.True(t, newPeriodExists, "New sync period should be stored")
+	assert.Equal(t, newSyncPeriod, newPeriod, "New sync period should match")
+	assert.NotEqual(t, timer, newTimer, "Timer should be different after update")
+
+	// Test timer cleanup
+	hc.cleanupHPATimer(hpaKey)
+
+	hc.timersMutex.RLock()
+	_, cleanedExists := hc.hpaTimers[hpaKey]
+	_, cleanedPeriodExists := hc.hpaSyncPeriods[hpaKey]
+	hc.timersMutex.RUnlock()
+
+	assert.False(t, cleanedExists, "Timer should not exist after cleanup")
+	assert.False(t, cleanedPeriodExists, "Sync period should not exist after cleanup")
+}
+
+// Test multiple HPAs with different sync periods
+func TestMultipleHPAsWithDifferentSyncPeriods(t *testing.T) {
+	testCases := []struct {
+		hpaName     string
+		namespace   string
+		annotation  string
+		expected    time.Duration
+	}{
+		{
+			hpaName:    "fast-hpa",
+			namespace:  "test",
+			annotation: "5s",
+			expected:   5 * time.Second,
+		},
+		{
+			hpaName:    "normal-hpa",
+			namespace:  "test",
+			annotation: "",
+			expected:   DefaultSyncPeriod,
+		},
+		{
+			hpaName:    "slow-hpa",
+			namespace:  "test",
+			annotation: "60s",
+			expected:   60 * time.Second,
+		},
+	}
+
+	hc := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+		hpaTimers:         make(map[string]*time.Timer),
+		hpaSyncPeriods:    make(map[string]time.Duration),
+		timersMutex:       sync.RWMutex{},
+	}
+
+	// Test creation of multiple HPAs with different sync periods
+	for _, tc := range testCases {
+		annotations := make(map[string]string)
+		if tc.annotation != "" {
+			annotations[HPASyncPeriodAnnotation] = tc.annotation
+		}
+
+		hpa := &autoscalingv2.HorizontalPodAutoscaler{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:        tc.hpaName,
+				Namespace:   tc.namespace,
+				Annotations: annotations,
+			},
+		}
+
+		hpaKey := tc.namespace + "/" + tc.hpaName
+		syncPeriod := hc.getSyncPeriodFromHPA(hpa)
+		hc.updateHPATimer(hpaKey, syncPeriod)
+
+		assert.Equal(t, tc.expected, syncPeriod, "Sync period should match expected for %s", tc.hpaName)
+	}
+
+	// Verify all timers exist
+	hc.timersMutex.RLock()
+	assert.Len(t, hc.hpaTimers, len(testCases), "Should have timers for all HPAs")
+	assert.Len(t, hc.hpaSyncPeriods, len(testCases), "Should have sync periods for all HPAs")
+	hc.timersMutex.RUnlock()
+
+	// Test individual sync periods
+	for _, tc := range testCases {
+		hpaKey := tc.namespace + "/" + tc.hpaName
+		
+		hc.timersMutex.RLock()
+		storedPeriod, exists := hc.hpaSyncPeriods[hpaKey]
+		hc.timersMutex.RUnlock()
+
+		assert.True(t, exists, "Sync period should exist for %s", tc.hpaName)
+		assert.Equal(t, tc.expected, storedPeriod, "Stored sync period should match expected for %s", tc.hpaName)
+	}
+}
+
+// Test HPA reconciliation with custom sync period
+func TestHPAReconciliationWithCustomSyncPeriod(t *testing.T) {
+	tc := testCase{
+		minReplicas:             2,
+		maxReplicas:             6,
+		specReplicas:            3,
+		statusReplicas:          3,
+		expectedDesiredReplicas: 5,
+		CPUTarget:               30,
+		verifyCPUCurrent:        true,
+		reportedLevels:          []uint64{300, 500, 700},
+		reportedCPURequests:     []resource.Quantity{resource.MustParse("1.0"), resource.MustParse("1.0"), resource.MustParse("1.0")},
+		useMetricsAPI:           true,
+		expectedReportedReconciliationActionLabel: monitor.ActionLabelScaleUp,
+		expectedReportedReconciliationErrorLabel:  monitor.ErrorLabelNone,
+		expectedReportedMetricComputationActionLabels: map[autoscalingv2.MetricSourceType]monitor.ActionLabel{
+			autoscalingv2.ResourceMetricSourceType: monitor.ActionLabelScaleUp,
+		},
+		expectedReportedMetricComputationErrorLabels: map[autoscalingv2.MetricSourceType]monitor.ErrorLabel{
+			autoscalingv2.ResourceMetricSourceType: monitor.ErrorLabelNone,
+		},
+	}
+
+	// Override HPA creation to add sync period annotation
+	originalPrepareTestClient := tc.prepareTestClient
+	tc.prepareTestClient = func(t *testing.T) (*fake.Clientset, *metricsfake.Clientset, *cmfake.FakeCustomMetricsClient, *emfake.FakeExternalMetricsClient, *scalefake.FakeScaleClient) {
+		testClient, testMetricsClient, testCMClient, testEMClient, testScaleClient := originalPrepareTestClient(t)
+		
+		// Add custom reactor for HPA list with sync period annotation
+		testClient.PrependReactor("list", "horizontalpodautoscalers", func(action core.Action) (handled bool, ret runtime.Object, err error) {
+			tc.Lock()
+			defer tc.Unlock()
+			
+			var behavior *autoscalingv2.HorizontalPodAutoscalerBehavior
+			if tc.scaleUpRules != nil || tc.scaleDownRules != nil {
+				behavior = &autoscalingv2.HorizontalPodAutoscalerBehavior{
+					ScaleUp:   tc.scaleUpRules,
+					ScaleDown: tc.scaleDownRules,
+				}
+			}
+			
+			hpa := autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-hpa",
+					Namespace: "test-namespace",
+					Annotations: map[string]string{
+						HPASyncPeriodAnnotation: "5s", // Custom sync period
+					},
+				},
+				Spec: autoscalingv2.HorizontalPodAutoscalerSpec{
+					ScaleTargetRef: autoscalingv2.CrossVersionObjectReference{
+						Kind:       tc.resource.kind,
+						Name:       tc.resource.name,
+						APIVersion: tc.resource.apiVersion,
+					},
+					MinReplicas: &tc.minReplicas,
+					MaxReplicas: tc.maxReplicas,
+					Behavior:    behavior,
+				},
+				Status: autoscalingv2.HorizontalPodAutoscalerStatus{
+					CurrentReplicas: tc.specReplicas,
+					DesiredReplicas: tc.specReplicas,
+					LastScaleTime:   tc.lastScaleTime,
+				},
+			}
+			
+			// Initialize default values
+			autoscalingapiv2.SetDefaults_HorizontalPodAutoscalerBehavior(&hpa)
+
+			obj := &autoscalingv2.HorizontalPodAutoscalerList{
+				Items: []autoscalingv2.HorizontalPodAutoscaler{hpa},
+			}
+
+			if tc.CPUTarget > 0 {
+				obj.Items[0].Spec.Metrics = []autoscalingv2.MetricSpec{
+					{
+						Type: autoscalingv2.ResourceMetricSourceType,
+						Resource: &autoscalingv2.ResourceMetricSource{
+							Name: v1.ResourceCPU,
+							Target: autoscalingv2.MetricTarget{
+								Type:               autoscalingv2.UtilizationMetricType,
+								AverageUtilization: &tc.CPUTarget,
+							},
+						},
+					},
+				}
+			}
+			if len(tc.metricsTarget) > 0 {
+				obj.Items[0].Spec.Metrics = append(obj.Items[0].Spec.Metrics, tc.metricsTarget...)
+			}
+
+			if len(obj.Items[0].Spec.Metrics) == 0 {
+				obj.Items[0].Spec.Metrics = []autoscalingv2.MetricSpec{
+					{
+						Type: autoscalingv2.ResourceMetricSourceType,
+						Resource: &autoscalingv2.ResourceMetricSource{
+							Name: v1.ResourceCPU,
+						},
+					},
+				}
+			}
+
+			return true, obj, nil
+		})
+		
+		return testClient, testMetricsClient, testCMClient, testEMClient, testScaleClient
+	}
+
+	hpaController, informerFactory := tc.setupController(t)
+	
+	// Verify that the custom sync period was applied
+	ctx := context.Background()
+	hpaList, err := hpaController.hpaLister.List(labels.Everything())
+	assert.NoError(t, err)
+	assert.Len(t, hpaList, 1)
+	
+	hpa := hpaList[0]
+	syncPeriod := hpaController.getSyncPeriodFromHPA(hpa)
+	assert.Equal(t, 5*time.Second, syncPeriod, "Custom sync period should be applied")
+	
+	tc.runTestWithController(t, hpaController, informerFactory)
+}
+
+// Test sync period validation edge cases
+func TestSyncPeriodValidationEdgeCases(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotation  string
+		expected    time.Duration
+		description string
+	}{
+		{
+			name:        "exactly minimum",
+			annotation:  "1s",
+			expected:    1 * time.Second,
+			description: "Should accept exactly 1 second",
+		},
+		{
+			name:        "exactly maximum", 
+			annotation:  "1h",
+			expected:    1 * time.Hour,
+			description: "Should accept exactly 1 hour",
+		},
+		{
+			name:        "just below minimum",
+			annotation:  "999ms",
+			expected:    MinSyncPeriod,
+			description: "Should clamp to minimum",
+		},
+		{
+			name:        "just above maximum",
+			annotation:  "61m",
+			expected:    MaxSyncPeriod,
+			description: "Should clamp to maximum",
+		},
+		{
+			name:        "zero duration",
+			annotation:  "0s",
+			expected:    MinSyncPeriod,
+			description: "Should clamp zero to minimum",
+		},
+		{
+			name:        "negative duration",
+			annotation:  "-5s",
+			expected:    DefaultSyncPeriod,
+			description: "Should use default for invalid negative",
+		},
+		{
+			name:        "empty string",
+			annotation:  "",
+			expected:    DefaultSyncPeriod,
+			description: "Should use default for empty string",
+		},
+		{
+			name:        "whitespace only",
+			annotation:  "   ",
+			expected:    DefaultSyncPeriod,
+			description: "Should use default for whitespace",
+		},
+	}
+
+	hc := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			annotations := map[string]string{}
+			if tt.annotation != "" {
+				annotations[HPASyncPeriodAnnotation] = tt.annotation
+			}
+
+			hpa := &autoscalingv2.HorizontalPodAutoscaler{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-hpa",
+					Namespace:   "test",
+					Annotations: annotations,
+				},
+			}
+
+			result := hc.getSyncPeriodFromHPA(hpa)
+			assert.Equal(t, tt.expected, result, tt.description)
+		})
+	}
+}
+
+// Test concurrent timer operations
+func TestConcurrentTimerOperations(t *testing.T) {
+	hc := &HorizontalController{
+		defaultSyncPeriod: DefaultSyncPeriod,
+		hpaTimers:         make(map[string]*time.Timer),
+		hpaSyncPeriods:    make(map[string]time.Duration),
+		timersMutex:       sync.RWMutex{},
+	}
+
+	const numGoroutines = 10
+	const numOperations = 100
+	var wg sync.WaitGroup
+
+	// Test concurrent timer creation and cleanup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(goroutineID int) {
+			defer wg.Done()
+			
+			for j := 0; j < numOperations; j++ {
+				hpaKey := fmt.Sprintf("test-namespace/test-hpa-%d-%d", goroutineID, j)
+				syncPeriod := time.Duration(5+j%10) * time.Second
+				
+				// Create timer
+				hc.updateHPATimer(hpaKey, syncPeriod)
+				
+				// Verify timer exists
+				hc.timersMutex.RLock()
+				_, exists := hc.hpaTimers[hpaKey]
+				storedPeriod, periodExists := hc.hpaSyncPeriods[hpaKey]
+				hc.timersMutex.RUnlock()
+				
+				assert.True(t, exists, "Timer should exist")
+				assert.True(t, periodExists, "Sync period should exist")
+				assert.Equal(t, syncPeriod, storedPeriod, "Sync period should match")
+				
+				// Cleanup timer
+				hc.cleanupHPATimer(hpaKey)
+				
+				// Verify timer is cleaned up
+				hc.timersMutex.RLock()
+				_, cleanedExists := hc.hpaTimers[hpaKey]
+				_, cleanedPeriodExists := hc.hpaSyncPeriods[hpaKey]
+				hc.timersMutex.RUnlock()
+				
+				assert.False(t, cleanedExists, "Timer should not exist after cleanup")
+				assert.False(t, cleanedPeriodExists, "Sync period should not exist after cleanup")
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	
+	// Verify all timers are cleaned up
+	hc.timersMutex.RLock()
+	assert.Len(t, hc.hpaTimers, 0, "All timers should be cleaned up")
+	assert.Len(t, hc.hpaSyncPeriods, 0, "All sync periods should be cleaned up")
+	hc.timersMutex.RUnlock()
+}
