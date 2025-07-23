@@ -21,10 +21,14 @@ package app
 
 import (
 	"context"
+	"reflect"
 
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/scale"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/controller-manager/controller"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/cmd/kube-controller-manager/names"
 	"k8s.io/kubernetes/pkg/controller/podautoscaler"
 	"k8s.io/kubernetes/pkg/controller/podautoscaler/metrics"
@@ -76,7 +80,8 @@ func startHPAControllerWithMetricsClient(ctx context.Context, controllerContext 
 		return nil, false, err
 	}
 
-	go podautoscaler.NewHorizontalController(
+	// Create the HPA controller
+	hpaController := podautoscaler.NewHorizontalController(
 		ctx,
 		hpaClient.CoreV1(),
 		scaleClient,
@@ -90,6 +95,81 @@ func startHPAControllerWithMetricsClient(ctx context.Context, controllerContext 
 		controllerContext.ComponentConfig.HPAController.HorizontalPodAutoscalerTolerance,
 		controllerContext.ComponentConfig.HPAController.HorizontalPodAutoscalerCPUInitializationPeriod.Duration,
 		controllerContext.ComponentConfig.HPAController.HorizontalPodAutoscalerInitialReadinessDelay.Duration,
-	).Run(ctx, int(controllerContext.ComponentConfig.HPAController.ConcurrentHorizontalPodAutoscalerSyncs))
+	)
+
+	// Setup event handlers for per-HPA sync period changes
+	hpaInformer := controllerContext.InformerFactory.Autoscaling().V2().HorizontalPodAutoscalers().Informer()
+	
+	// Add event handlers to detect sync period annotation changes
+	hpaInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			hpa, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler)
+			if !ok {
+				klog.Warningf("Expected HPA object, got %T", obj)
+				return
+			}
+			hpaKey := hpa.Namespace + "/" + hpa.Name
+			syncPeriod := hpaController.GetSyncPeriodFromHPA(hpa)
+			hpaController.UpdateHPATimer(hpaKey, syncPeriod)
+			klog.V(4).Infof("Added HPA %s with sync period %v", hpaKey, syncPeriod)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldHPA, ok1 := oldObj.(*autoscalingv2.HorizontalPodAutoscaler)
+			newHPA, ok2 := newObj.(*autoscalingv2.HorizontalPodAutoscaler)
+			if !ok1 || !ok2 {
+				klog.Warningf("Expected HPA objects, got %T and %T", oldObj, newObj)
+				return
+			}
+			
+			hpaKey := newHPA.Namespace + "/" + newHPA.Name
+			
+			// Check if sync period annotation changed
+			oldSyncPeriod := ""
+			newSyncPeriod := ""
+			
+			if oldHPA.Annotations != nil {
+				oldSyncPeriod = oldHPA.Annotations[podautoscaler.HPASyncPeriodAnnotation]
+			}
+			if newHPA.Annotations != nil {
+				newSyncPeriod = newHPA.Annotations[podautoscaler.HPASyncPeriodAnnotation]
+			}
+			
+			if oldSyncPeriod != newSyncPeriod {
+				syncPeriod := hpaController.GetSyncPeriodFromHPA(newHPA)
+				hpaController.UpdateHPATimer(hpaKey, syncPeriod)
+				klog.V(2).Infof("Sync period changed for HPA %s: '%s' -> '%s' (parsed: %v)", 
+					hpaKey, oldSyncPeriod, newSyncPeriod, syncPeriod)
+			}
+			
+			// Also check for other changes that might affect sync behavior
+			if !reflect.DeepEqual(oldHPA.Spec, newHPA.Spec) {
+				klog.V(4).Infof("HPA spec changed for %s, sync period may need re-evaluation", hpaKey)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			hpa, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler)
+			if !ok {
+				// Handle DeletedFinalStateUnknown
+				if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+					hpa, ok = tombstone.Obj.(*autoscalingv2.HorizontalPodAutoscaler)
+					if !ok {
+						klog.Warningf("Expected HPA object in tombstone, got %T", tombstone.Obj)
+						return
+					}
+				} else {
+					klog.Warningf("Expected HPA object, got %T", obj)
+					return
+				}
+			}
+			hpaKey := hpa.Namespace + "/" + hpa.Name
+			hpaController.CleanupHPATimer(hpaKey)
+			klog.V(4).Infof("Deleted HPA %s, cleaned up timer", hpaKey)
+		},
+	})
+
+	// Start the controller
+	go hpaController.Run(ctx, int(controllerContext.ComponentConfig.HPAController.ConcurrentHorizontalPodAutoscalerSyncs))
+
+	klog.V(1).Info("Started HPA controller with per-HPA sync period support")
 	return nil, true, nil
 }

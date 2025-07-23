@@ -70,6 +70,15 @@ var (
 	errSpec error = errors.New("")
 )
 
+const (
+	// HPASyncPeriodAnnotation is the annotation key for configuring per-HPA sync periods
+	HPASyncPeriodAnnotation = "hpa.kubernetes.io/sync-period"
+	// Default and validation constants for sync periods
+	DefaultSyncPeriod = 15 * time.Second
+	MinSyncPeriod     = 1 * time.Second
+	MaxSyncPeriod     = 1 * time.Hour
+)
+
 type timestampedRecommendation struct {
 	recommendation int32
 	timestamp      time.Time
@@ -123,6 +132,12 @@ type HorizontalController struct {
 	// Storage of HPAs and their selectors.
 	hpaSelectors    *selectors.BiMultimap
 	hpaSelectorsMux sync.Mutex
+
+	// Per-HPA sync period management
+	defaultSyncPeriod time.Duration
+	hpaTimers         map[string]*time.Timer
+	hpaSyncPeriods    map[string]time.Duration
+	timersMutex       sync.RWMutex
 }
 
 // NewHorizontalController creates a new HorizontalController.
@@ -167,6 +182,11 @@ func NewHorizontalController(
 		scaleDownEvents:     map[string][]timestampedScaleEvent{},
 		scaleDownEventsLock: sync.RWMutex{},
 		hpaSelectors:        selectors.NewBiMultimap(),
+		// Per-HPA sync period fields
+		defaultSyncPeriod: resyncPeriod,
+		hpaTimers:         make(map[string]*time.Timer),
+		hpaSyncPeriods:    make(map[string]time.Duration),
+		timersMutex:       sync.RWMutex{},
 	}
 
 	hpaInformer.Informer().AddEventHandlerWithResyncPeriod(
@@ -196,6 +216,103 @@ func NewHorizontalController(
 	return hpaController
 }
 
+// getSyncPeriodFromHPA extracts the sync period from HPA annotations
+func (a *HorizontalController) getSyncPeriodFromHPA(hpa *autoscalingv2.HorizontalPodAutoscaler) time.Duration {
+	if hpa.Annotations == nil {
+		return a.defaultSyncPeriod
+	}
+
+	syncPeriodStr, exists := hpa.Annotations[HPASyncPeriodAnnotation]
+	if !exists {
+		return a.defaultSyncPeriod
+	}
+
+	duration, err := time.ParseDuration(syncPeriodStr)
+	if err != nil {
+		klog.Warningf("Invalid sync-period annotation '%s' for HPA %s/%s: %v, using default %v",
+			syncPeriodStr, hpa.Namespace, hpa.Name, err, a.defaultSyncPeriod)
+		return a.defaultSyncPeriod
+	}
+
+	// Validate the period
+	if duration < MinSyncPeriod {
+		klog.Warningf("Sync period %v for HPA %s/%s is too small, using minimum %v",
+			duration, hpa.Namespace, hpa.Name, MinSyncPeriod)
+		return MinSyncPeriod
+	}
+
+	if duration > MaxSyncPeriod {
+		klog.Warningf("Sync period %v for HPA %s/%s is too large, using maximum %v",
+			duration, hpa.Namespace, hpa.Name, MaxSyncPeriod)
+		return MaxSyncPeriod
+	}
+
+	return duration
+}
+
+// updateHPATimer updates or creates a timer for a specific HPA
+func (a *HorizontalController) updateHPATimer(hpaKey string, period time.Duration) {
+	a.timersMutex.Lock()
+	defer a.timersMutex.Unlock()
+
+	// Stop existing timer
+	if timer, exists := a.hpaTimers[hpaKey]; exists {
+		timer.Stop()
+		delete(a.hpaTimers, hpaKey)
+	}
+
+	// Update sync period tracking
+	a.hpaSyncPeriods[hpaKey] = period
+
+	// Start new timer
+	a.hpaTimers[hpaKey] = time.AfterFunc(period, func() {
+		// Enqueue this HPA for reconciliation
+		a.queue.AddRateLimited(hpaKey)
+
+		// Reschedule next sync
+		a.timersMutex.Lock()
+		if _, exists := a.hpaSyncPeriods[hpaKey]; exists {
+			// Only reschedule if HPA still exists
+			a.hpaTimers[hpaKey] = time.AfterFunc(period, func() {
+				a.queue.AddRateLimited(hpaKey)
+				// This creates a continuous loop for this HPA
+				a.updateHPATimer(hpaKey, period)
+			})
+		}
+		a.timersMutex.Unlock()
+	})
+
+	klog.V(4).Infof("Updated sync timer for HPA %s with period %v", hpaKey, period)
+}
+
+// cleanupHPATimer removes the timer for a specific HPA
+func (a *HorizontalController) cleanupHPATimer(hpaKey string) {
+	a.timersMutex.Lock()
+	defer a.timersMutex.Unlock()
+
+	if timer, exists := a.hpaTimers[hpaKey]; exists {
+		timer.Stop()
+		delete(a.hpaTimers, hpaKey)
+		delete(a.hpaSyncPeriods, hpaKey)
+		klog.V(4).Infof("Cleaned up timer for HPA %s", hpaKey)
+	}
+}
+
+// GetSyncPeriodFromHPA is a public method to expose getSyncPeriodFromHPA
+func (a *HorizontalController) GetSyncPeriodFromHPA(hpa *autoscalingv2.HorizontalPodAutoscaler) time.Duration {
+	return a.getSyncPeriodFromHPA(hpa)
+}
+
+// UpdateHPATimer is a public method to expose updateHPATimer
+func (a *HorizontalController) UpdateHPATimer(hpaKey string, period time.Duration) {
+	a.updateHPATimer(hpaKey, period)
+}
+
+// CleanupHPATimer is a public method to expose cleanupHPATimer
+func (a *HorizontalController) CleanupHPATimer(hpaKey string) {
+	a.cleanupHPATimer(hpaKey)
+}
+
 // Run begins watching and syncing.
 func (a *HorizontalController) Run(ctx context.Context, workers int) {
 	defer utilruntime.HandleCrash()
@@ -209,15 +326,70 @@ func (a *HorizontalController) Run(ctx context.Context, workers int) {
 		return
 	}
 
+	// Initialize timers for existing HPAs
+	a.initializeExistingHPATimers(ctx)
+
 	for i := 0; i < workers; i++ {
 		go wait.UntilWithContext(ctx, a.worker, time.Second)
 	}
 
 	<-ctx.Done()
+
+	// Cleanup all timers
+	a.timersMutex.Lock()
+	for hpaKey, timer := range a.hpaTimers {
+		timer.Stop()
+		delete(a.hpaTimers, hpaKey)
+		delete(a.hpaSyncPeriods, hpaKey)
+	}
+	a.timersMutex.Unlock()
+}
+
+// initializeExistingHPATimers sets up timers for HPAs that already exist during startup
+func (a *HorizontalController) initializeExistingHPATimers(ctx context.Context) {
+	logger := klog.FromContext(ctx)
+	
+	hpas, err := a.hpaLister.List(labels.Everything())
+	if err != nil {
+		logger.Error(err, "Failed to list existing HPAs during initialization")
+		return
+	}
+
+	for _, hpa := range hpas {
+		hpaKey := hpa.Namespace + "/" + hpa.Name
+		syncPeriod := a.getSyncPeriodFromHPA(hpa)
+		a.updateHPATimer(hpaKey, syncPeriod)
+		logger.V(4).Info("Initialized timer for existing HPA", "HPA", hpaKey, "syncPeriod", syncPeriod)
+	}
 }
 
 // obj could be an *v1.HorizontalPodAutoscaler, or a DeletionFinalStateUnknown marker item.
 func (a *HorizontalController) updateHPA(old, cur interface{}) {
+	oldHPA, ok1 := old.(*autoscalingv2.HorizontalPodAutoscaler)
+	newHPA, ok2 := cur.(*autoscalingv2.HorizontalPodAutoscaler)
+
+	if ok1 && ok2 {
+		hpaKey := newHPA.Namespace + "/" + newHPA.Name
+
+		// Check if sync period annotation changed
+		oldSyncPeriod := ""
+		newSyncPeriod := ""
+
+		if oldHPA.Annotations != nil {
+			oldSyncPeriod = oldHPA.Annotations[HPASyncPeriodAnnotation]
+		}
+		if newHPA.Annotations != nil {
+			newSyncPeriod = newHPA.Annotations[HPASyncPeriodAnnotation]
+		}
+
+		if oldSyncPeriod != newSyncPeriod {
+			syncPeriod := a.getSyncPeriodFromHPA(newHPA)
+			a.updateHPATimer(hpaKey, syncPeriod)
+			klog.V(2).Infof("Sync period changed for HPA %s: %s -> %s (parsed: %v)",
+				hpaKey, oldSyncPeriod, newSyncPeriod, syncPeriod)
+		}
+	}
+
 	a.enqueueHPA(cur)
 }
 
@@ -227,6 +399,21 @@ func (a *HorizontalController) enqueueHPA(obj interface{}) {
 	if err != nil {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
 		return
+	}
+
+	// For new HPAs, set up the timer
+	if hpa, ok := obj.(*autoscalingv2.HorizontalPodAutoscaler); ok {
+		hpaKey := hpa.Namespace + "/" + hpa.Name
+		
+		a.timersMutex.RLock()
+		_, exists := a.hpaSyncPeriods[hpaKey]
+		a.timersMutex.RUnlock()
+		
+		if !exists {
+			syncPeriod := a.getSyncPeriodFromHPA(hpa)
+			a.updateHPATimer(hpaKey, syncPeriod)
+			klog.V(4).Infof("Set up timer for new HPA %s with period %v", hpaKey, syncPeriod)
+		}
 	}
 
 	// Requests are always added to queue with resyncPeriod delay.  If there's already
@@ -250,6 +437,9 @@ func (a *HorizontalController) deleteHPA(obj interface{}) {
 		utilruntime.HandleError(fmt.Errorf("couldn't get key for object %+v: %v", obj, err))
 		return
 	}
+
+	// Clean up the timer for this HPA
+	a.cleanupHPATimer(key)
 
 	// TODO: could we leak if we fail to get the key?
 	a.queue.Forget(key)
@@ -278,17 +468,18 @@ func (a *HorizontalController) processNextWorkItem(ctx context.Context) bool {
 	if err != nil {
 		utilruntime.HandleError(err)
 	}
-	// Add request processing HPA to queue with resyncPeriod delay.
-	// Requests are always added to queue with resyncPeriod delay. If there's already request
-	// for the HPA in the queue then a new request is always dropped. Requests spend resyncPeriod
-	// in queue so HPAs are processed every resyncPeriod.
-	// Request is added here just in case last resync didn't insert request into the queue. This
-	// happens quite often because there is race condition between adding request after resyncPeriod
-	// and removing them from queue. Request can be added by resync before previous request is
-	// removed from queue. If we didn't add request here then in this case one request would be dropped
-	// and HPA would process after 2 x resyncPeriod.
+	
+	// For per-HPA sync periods, we don't add back to queue here since the timer handles it
+	// Only add back if HPA was not deleted and no timer exists (fallback)
 	if !deleted {
-		a.queue.AddRateLimited(key)
+		a.timersMutex.RLock()
+		_, hasTimer := a.hpaSyncPeriods[key]
+		a.timersMutex.RUnlock()
+		
+		if !hasTimer {
+			// Fallback: if no timer exists, use the old behavior
+			a.queue.AddRateLimited(key)
+		}
 	}
 
 	return true
@@ -521,6 +712,9 @@ func (a *HorizontalController) reconcileKey(ctx context.Context, key string) (de
 		a.scaleDownEventsLock.Lock()
 		delete(a.scaleDownEvents, key)
 		a.scaleDownEventsLock.Unlock()
+
+		// Clean up timer
+		a.cleanupHPATimer(key)
 
 		return true, nil
 	}
@@ -766,6 +960,20 @@ func (a *HorizontalController) reconcileAutoscaler(ctx context.Context, hpaShare
 	// make a copy so that we never mutate the shared informer cache (conversion can mutate the object)
 	hpa := hpaShared.DeepCopy()
 	hpaStatusOriginal := hpa.Status.DeepCopy()
+
+	// Check and update sync period if needed
+	hpaKey := hpa.Namespace + "/" + hpa.Name
+	desiredSyncPeriod := a.getSyncPeriodFromHPA(hpa)
+
+	a.timersMutex.RLock()
+	currentSyncPeriod, exists := a.hpaSyncPeriods[hpaKey]
+	a.timersMutex.RUnlock()
+
+	if !exists || currentSyncPeriod != desiredSyncPeriod {
+		klog.V(4).Infof("Updating sync period for HPA %s from %v to %v",
+			hpaKey, currentSyncPeriod, desiredSyncPeriod)
+		a.updateHPATimer(hpaKey, desiredSyncPeriod)
+	}
 
 	reference := fmt.Sprintf("%s/%s/%s", hpa.Spec.ScaleTargetRef.Kind, hpa.Namespace, hpa.Spec.ScaleTargetRef.Name)
 
