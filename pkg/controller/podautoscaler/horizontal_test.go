@@ -6080,9 +6080,10 @@ func TestInitializeExistingHPATimers(t *testing.T) {
 
 	informerFactory := informers.NewSharedInformerFactory(testClient, controller.NoResyncPeriodFunc())
 	
-	// Create a simple fake metrics client - FIX: Use pointer to metricsfake.Clientset
+	// Create a simple fake metrics client
+	testMetricsClient := &metricsfake.Clientset{}
 	fakeMetricsClient := metrics.NewRESTMetricsClient(
-		(&metricsfake.Clientset{}).MetricsV1beta1(), // Add parentheses and reference
+		testMetricsClient.MetricsV1beta1(),
 		&cmfake.FakeCustomMetricsClient{},
 		&emfake.FakeExternalMetricsClient{},
 	)
@@ -6129,6 +6130,15 @@ func TestInitializeExistingHPATimers(t *testing.T) {
 		assert.True(t, timerExists, "Timer should exist for %s", hpaKey)
 	}
 	hpaController.timersMutex.RUnlock()
+
+	// Cleanup all timers to prevent memory leaks and panics
+	hpaController.timersMutex.Lock()
+	for hpaKey, timer := range hpaController.hpaTimers {
+		timer.Stop()
+		delete(hpaController.hpaTimers, hpaKey)
+		delete(hpaController.hpaSyncPeriods, hpaKey)
+	}
+	hpaController.timersMutex.Unlock()
 }
 
 // Test voor concurrent timer operations
