@@ -280,24 +280,19 @@ func (a *HorizontalController) handleTimerCallback(hpaKey string) {
 	}
 
 	// Reschedule if HPA still exists
-	a.timersMutex.RLock()
-	period, exists := a.hpaSyncPeriods[hpaKey]
-	a.timersMutex.RUnlock()
-
-	if exists {
-		// Schedule next execution
-		a.timersMutex.Lock()
-		// Double-check existence after acquiring write lock
-		if currentPeriod, stillExists := a.hpaSyncPeriods[hpaKey]; stillExists {
-			if timer, hasTimer := a.hpaTimers[hpaKey]; hasTimer {
-				timer.Stop() // Stop old timer if it exists
-			}
-			// Create new timer for next cycle
-			a.hpaTimers[hpaKey] = time.AfterFunc(currentPeriod, func() {
-				a.handleTimerCallback(hpaKey)
-			})
+	a.timersMutex.Lock()
+	defer a.timersMutex.Unlock()
+	
+	// Check if HPA still exists and get its current period
+	if currentPeriod, exists := a.hpaSyncPeriods[hpaKey]; exists {
+		// Stop old timer if it exists
+		if timer, hasTimer := a.hpaTimers[hpaKey]; hasTimer {
+			timer.Stop()
 		}
-		a.timersMutex.Unlock()
+		// Create new timer for next cycle
+		a.hpaTimers[hpaKey] = time.AfterFunc(currentPeriod, func() {
+			a.handleTimerCallback(hpaKey)
+		})
 	}
 }
 
