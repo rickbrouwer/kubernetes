@@ -6080,9 +6080,9 @@ func TestInitializeExistingHPATimers(t *testing.T) {
 
 	informerFactory := informers.NewSharedInformerFactory(testClient, controller.NoResyncPeriodFunc())
 	
-	// Create a simple fake metrics client
+	// Create a simple fake metrics client - FIX: Use pointer to metricsfake.Clientset
 	fakeMetricsClient := metrics.NewRESTMetricsClient(
-		&metricsfake.Clientset{}.MetricsV1beta1(),
+		(&metricsfake.Clientset{}).MetricsV1beta1(), // Add parentheses and reference
 		&cmfake.FakeCustomMetricsClient{},
 		&emfake.FakeExternalMetricsClient{},
 	)
