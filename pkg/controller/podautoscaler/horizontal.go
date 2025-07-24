@@ -264,25 +264,41 @@ func (a *HorizontalController) updateHPATimer(hpaKey string, period time.Duratio
 	// Update sync period tracking
 	a.hpaSyncPeriods[hpaKey] = period
 
-	// Start new timer
+	// Start new timer with safer callback
 	a.hpaTimers[hpaKey] = time.AfterFunc(period, func() {
-		// Enqueue this HPA for reconciliation
-		a.queue.AddRateLimited(hpaKey)
-
-		// Reschedule next sync
-		a.timersMutex.Lock()
-		if _, exists := a.hpaSyncPeriods[hpaKey]; exists {
-			// Only reschedule if HPA still exists
-			a.hpaTimers[hpaKey] = time.AfterFunc(period, func() {
-				a.queue.AddRateLimited(hpaKey)
-				// This creates a continuous loop for this HPA
-				a.updateHPATimer(hpaKey, period)
-			})
-		}
-		a.timersMutex.Unlock()
+		a.handleTimerCallback(hpaKey)
 	})
 
 	klog.V(4).Infof("Updated sync timer for HPA %s with period %v", hpaKey, period)
+}
+
+// handleTimerCallback safely handles timer callbacks
+func (a *HorizontalController) handleTimerCallback(hpaKey string) {
+	// Add to queue for reconciliation
+	if a.queue != nil {
+		a.queue.AddRateLimited(hpaKey)
+	}
+
+	// Reschedule if HPA still exists
+	a.timersMutex.RLock()
+	period, exists := a.hpaSyncPeriods[hpaKey]
+	a.timersMutex.RUnlock()
+
+	if exists {
+		// Schedule next execution
+		a.timersMutex.Lock()
+		// Double-check existence after acquiring write lock
+		if currentPeriod, stillExists := a.hpaSyncPeriods[hpaKey]; stillExists {
+			if timer, hasTimer := a.hpaTimers[hpaKey]; hasTimer {
+				timer.Stop() // Stop old timer if it exists
+			}
+			// Create new timer for next cycle
+			a.hpaTimers[hpaKey] = time.AfterFunc(currentPeriod, func() {
+				a.handleTimerCallback(hpaKey)
+			})
+		}
+		a.timersMutex.Unlock()
+	}
 }
 
 // cleanupHPATimer removes the timer for a specific HPA
